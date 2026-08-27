@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MuJoCo viewer</title>
+
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1e1e1e;
+    color: #ddd;
+    font-family: system-ui, sans-serif;
+    overflow: hidden;
+  }
+
+  #wrap {
+    display: flex;
+    height: 100%;
+  }
+
+  #canvas-holder {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+  }
+
+  canvas {
+    max-width: 100%;
+    max-height: 100%;
+    background: #000;
+    display: block;
+  }
+
+  #panel {
+    width: 220px;
+    padding: 12px;
+    box-sizing: border-box;
+    font-size: 13px;
+    border-left: 1px solid #333;
+  }
+
+  #panel h1 {
+    font-size: 15px;
+    margin: 0 0 10px 0;
+  }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    margin: 6px 0;
+  }
+
+  #status.disconnected {
+    color: #e57;
+  }
+
+  #status.connected {
+    color: #7c7;
+  }
+</style>
+</head>
+
+<body>
+
+<div id="wrap">
+
+  <div id="canvas-holder">
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <div id="panel">
+    <h1>MuJoCo viewer</h1>
+
+    <div class="row">
+      <span>connection</span>
+      <span id="status" class="disconnected">connecting…</span>
+    </div>
+
+    <div class="row">
+      <span>frames/s</span>
+      <span id="fps">–</span>
+    </div>
+
+    <div class="row">
+      <span>sim time</span>
+      <span id="time">–</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const statusEl = document.getElementById('status');
+const fpsEl = document.getElementById('fps');
+const timeEl = document.getElementById('time');
+
+
+// ---------------------------------------------------------------------------
+// Protocol
+// ---------------------------------------------------------------------------
+//
+// Server -> client WebSocket message:
+//
+//   [tag: u8]
+//   [payload_len: u32 LE]
+//   [payload]
+//
+// FRAME (0x80):
+//
+//   payload:
+//     [width:  u16 LE]
+//     [height: u16 LE]
+//     [JPEG bytes]
+//
+// STATE (0x81):
+//
+//   payload:
+//     UTF-8 JSON:
+//       {"time": <f64>}
+//
+// ---------------------------------------------------------------------------
+
+const TAG_FRAME = 0x80;
+const TAG_STATE = 0x81;
+
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+//
+// HTTP viewer:
+//
+//   http://host:9000
+//
+// WebSocket:
+//
+//   ws://host:9001
+//
+// The WebSocket intentionally lives on a separate port from HTTP.
+// ---------------------------------------------------------------------------
+
+const wsProtocol =
+  location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+const wsUrl =
+  `${wsProtocol}//${location.hostname}:9001`;
+
+console.log('connecting to', wsUrl);
+
+const ws = new WebSocket(wsUrl);
+
+ws.binaryType = 'arraybuffer';
+
+
+// ---------------------------------------------------------------------------
+// Frame rendering
+// ---------------------------------------------------------------------------
+//
+// Only retain the newest frame. If rendering is slower than the incoming
+// stream, intermediate frames are discarded rather than building a queue.
+//
+
+let latest = null;
+let drawing = false;
+
+async function drawFrame(bytes, width, height) {
+  if (canvas.width !== width) {
+    canvas.width = width;
+  }
+
+  if (canvas.height !== height) {
+    canvas.height = height;
+  }
+
+  const blob = new Blob(
+    [bytes],
+    { type: 'image/jpeg' }
+  );
+
+  const bitmap = await createImageBitmap(blob);
+
+  ctx.drawImage(
+    bitmap,
+    0,
+    0,
+    width,
+    height
+  );
+
+  bitmap.close();
+}
+
+let framesDrawn = 0;
+
+async function pumpFrames() {
+  if (drawing) {
+    return;
+  }
+
+  drawing = true;
+
+  try {
+    while (latest !== null) {
+      const frame = latest;
+
+      // Clear immediately so that an incoming frame replaces it.
+      latest = null;
+
+      try {
+        await drawFrame(
+          frame.jpeg,
+          frame.width,
+          frame.height
+        );
+
+        framesDrawn++;
+      } catch (error) {
+        console.error(
+          'failed to render frame:',
+          error
+        );
+      }
+    }
+  } finally {
+    drawing = false;
+
+    // A frame could have arrived between the last loop iteration and
+    // setting drawing=false.
+    if (latest !== null) {
+      pumpFrames();
+    }
+  }
+}
+
+function onFrame(jpeg, width, height) {
+  latest = {
+    jpeg,
+    width,
+    height
+  };
+
+  pumpFrames();
+}
+
+
+// ---------------------------------------------------------------------------
+// WebSocket events
+// ---------------------------------------------------------------------------
+
+ws.onopen = () => {
+  console.log('WebSocket connected');
+
+  statusEl.textContent = 'connected';
+  statusEl.className = 'connected';
+};
+
+ws.onclose = (event) => {
+  console.log(
+    'WebSocket closed',
+    event.code,
+    event.reason
+  );
+
+  statusEl.textContent = 'disconnected';
+  statusEl.className = 'disconnected';
+};
+
+ws.onerror = (error) => {
+  console.error(
+    'WebSocket error:',
+    error
+  );
+
+  statusEl.textContent = 'error';
+  statusEl.className = 'disconnected';
+};
+
+
+// ---------------------------------------------------------------------------
+// WebSocket message parsing
+// ---------------------------------------------------------------------------
+
+ws.onmessage = (event) => {
+  if (!(event.data instanceof ArrayBuffer)) {
+    console.warn(
+      'received non-binary WebSocket message'
+    );
+
+    return;
+  }
+
+  const bytes = new Uint8Array(event.data);
+
+  //
+  // Minimum:
+  //
+  //   tag (1)
+  //   length (4)
+  //
+  if (bytes.length < 5) {
+    console.warn(
+      'received truncated message'
+    );
+
+    return;
+  }
+
+  const tag = bytes[0];
+
+  //
+  // IMPORTANT:
+  //
+  // Rust uses:
+  //
+  //   to_le_bytes()
+  //
+  // therefore this MUST be decoded little-endian.
+  //
+  const payloadLength =
+    bytes[1] |
+    (bytes[2] << 8) |
+    (bytes[3] << 16) |
+    (bytes[4] << 24);
+
+  //
+  // JavaScript bitwise operations produce signed 32-bit integers.
+  // Convert back to unsigned.
+  //
+  const len = payloadLength >>> 0;
+
+  const payloadStart = 5;
+  const payloadEnd = payloadStart + len;
+
+  if (payloadEnd > bytes.length) {
+    console.warn(
+      'truncated WebSocket payload:',
+      {
+        expected: payloadEnd,
+        received: bytes.length
+      }
+    );
+
+    return;
+  }
+
+  const payload =
+    bytes.subarray(
+      payloadStart,
+      payloadEnd
+    );
+
+
+  // -------------------------------------------------------------------------
+  // FRAME
+  // -------------------------------------------------------------------------
+
+  if (tag === TAG_FRAME) {
+
+    //
+    // FRAME payload:
+    //
+    //   [width:  u16 LE]
+    //   [height: u16 LE]
+    //   [jpeg]
+    //
+
+    if (payload.length < 4) {
+      console.warn(
+        'truncated frame payload'
+      );
+
+      return;
+    }
+
+    const width =
+      payload[0] |
+      (payload[1] << 8);
+
+    const height =
+      payload[2] |
+      (payload[3] << 8);
+
+    const jpeg =
+      payload.slice(4);
+
+    if (jpeg.length === 0) {
+      console.warn(
+        'empty JPEG frame'
+      );
+
+      return;
+    }
+
+    onFrame(
+      jpeg,
+      width,
+      height
+    );
+
+    return;
+  }
+
+
+  // -------------------------------------------------------------------------
+  // STATE
+  // -------------------------------------------------------------------------
+
+  if (tag === TAG_STATE) {
+
+    try {
+      const json =
+        new TextDecoder().decode(payload);
+
+      const state =
+        JSON.parse(json);
+
+      if (
+        typeof state.time === 'number' &&
+        Number.isFinite(state.time)
+      ) {
+        timeEl.textContent =
+          state.time.toFixed(3) + ' s';
+      }
+    } catch (error) {
+      console.error(
+        'failed to parse state message:',
+        error
+      );
+    }
+
+    return;
+  }
+
+
+  console.warn(
+    'unknown server message tag:',
+    tag
+  );
+};
+
+
+// ---------------------------------------------------------------------------
+// FPS counter
+// ---------------------------------------------------------------------------
+
+let lastFrames = 0;
+
+setInterval(() => {
+  const current = framesDrawn;
+
+  fpsEl.textContent =
+    String(current - lastFrames);
+
+  lastFrames = current;
+}, 1000);
+
+</script>
+
+</body>
+</html>
+

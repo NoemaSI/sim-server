@@ -1,0 +1,4 @@
+/target
+/lib
+libmujoco.dylib
+/mujoco.framework/

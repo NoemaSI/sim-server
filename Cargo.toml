@@ -1,0 +1,14 @@
+[package]
+name = "sim-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+image = "0.25.10"
+mujoco-rs = { version = "5.0.0", features=["renderer","renderer-winit-fallback"] }
+tungstenite = "0.30.0"
+
+[patch.crates-io]
+glutin = { git = "https://github.com/NoemaSI/glutin_macos", rev = "a678fdc86de438ebaef77b89688d88398611de37"}
+#mujoco-rs = { path = "./mujoco-rs-local" }
+
